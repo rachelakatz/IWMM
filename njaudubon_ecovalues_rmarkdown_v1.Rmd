@@ -1,0 +1,1388 @@
+---
+title: "DRAFT - Ecological Values of R5 Impoundments"
+date: "Last Updated: January 31 2017"
+output: 
+  html_notebook:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    fig_height: 6
+    fig_width: 8
+    code_folding: show
+    theme: united
+    highlight: textmate
+---
+
+**CLICK ON "CODE" IN UPPER RIGHT AND "HIDE ALL CODE"**
+
+## Project Description
+
+Contact: Rachel Katz - rachel_katz@fws.gov. 
+
+This document was created by Rachel Katz (Biometrician R5) to provide documentation for assessing ecological values of impoudments project for NJ Audubon Coastal Impoundment Vulnerability and Resilience Assessment Project.
+
+- Sandy funding to NJ Audubon; Nellie Tsipoura (PI); 2014-2016. 
+- Covers state and federal impoundments from Virginia to Maine
+- Goal: understand ecological values of impoundment across the region (to be synthesized with socio-ecoconomic values) to inform regional-decisions
+
+## Rachel's Notes
+
+### To Do
+
+- get common groupings of birds (values based on functional groups/guilds/status, etc; shorebirds, wating, water, marsh, etc.) - mindy?
+- get access to impoundment database with attributes (nellie?)
+- get list of fundamental objectives/metrics (nellie)
+- update this list with metrics that we can get with iwwm or ebird data for each impoundment
+- predict ecological value under "status quo" actions (these are unknown - need status quo for each impoundment to match bird data to current mgt scenarios)
+- new managmeent scenarios and predict ecological value for each impoundmnet - need list of management alternatives/strategies and predicted effects to simulate.
+- why map ebirds? Can we use ebird data to predict metrics at impoundments without IWMM data? Did chuck do this?
+
+### Potential ecological questions to answer:
+- What metrics are most interesing? Weekly or Monthly Counts? Are Bird-use days important? They aren't in here.
+- Which speices consistantly use refuge impoundments from year to year? (i.e. low sd counts)?
+- Which rare/at risk species use refuge impoundments? Do they use them consistantly or unpredictably?
+- Black Rails (ES) may prefer coastal impoundments (Amy RO/Atlantic Coast Joint Venture)- are they in our IWMM database and these impoundments - what other ES species are key for impoudments?
+- Can ebird data be used to predict bird arrival dates and inform timing of water level management decisions by refuge?
+
+## Rcode set up
+```{r notes,include=FALSE}
+#reporting tool IWMM: https://www.youtube.com/watch?v=KVxlOCVCp9E&feature=youtu.be
+#pub:http://iwmmprogram.org/documents/Evaluating_predictors_of_local_dabbling_duck_abundance_during_migration.pdf
+# find cacert.perm files in R library and replace with new one that Rick Blair modified
+# C:\Users\rkatz\Documents\R\win-library\3.3\rsconnect\cert\cacert.perm
+
+# RMarkdown Notes: sitefinder doesn't work with knitr so had to manually import ebird files. 
+
+```
+```{r setup,include=FALSE}
+##read in required packages.  these need to be installed one time on the machine before loading.##
+library(RCurl)
+
+library(ggplot2)
+library(rgdal) # for gis plots
+library(gstat)
+library(raster)
+library(MBA)
+library(dplyr) #rk add
+library(tidyr)
+library(plyr)
+
+#library(flexdashboard)
+library(knitr)
+library(plotly)
+library(rbokeh)
+library(dygraphs)
+library(xts)
+library(DT)
+
+library(highcharter)
+library(dplyr)
+library(viridisLite)
+library(forecast)
+library(treemap)
+library(leaflet)
+
+##set the directory to look for GIS files - need to update with final locations of files###
+#gisdir="h:/Projects/IWMM/gis"
+#gisdir="P:\frost\impoundment gis"
+gisdir="N:/NWRS/DNR/Coastal_Network/Impoundments"
+try1=readOGR("N:/NWRS/DNR/Coastal_Network/Impoundments", "Regions_345")
+try1@data$id = rownames(try1@data)
+try1.points = fortify(try1, region="id")
+try1.df = join(try1.points, try1@data, by="id") # convert for ggplot
+```
+```{r copyfunctionsover}
+#### Import and format iwmm data ####
+setwd("P:/frost/Projects/IWMM") 
+iwmm = read.csv("IWMMExport_All_20150210.csv", header =T, na.strings=c(""))
+xy = read.csv("IWMM_Unit_Points_XYs.csv", header=T, na.strings=c(""), stringsAsFactors=FALSE)
+codes = read.csv("IWMM_ImpoundmentCodes_20150401.csv", header=T, na.strings=c(""), stringsAsFactors=FALSE)
+names(codes)[1]="unit"
+xycodes=merge(xy, codes, by="unit")
+for(a in 1:length(iwmm$POINT_X)){
+if(is.na(iwmm$POINT_X[a])){
+if(any(iwmm$SiteName[a] %in% xycodes$SiteName)){
+if(any(xycodes$x[which(xycodes$SiteName==iwmm$SiteName[a] & xycodes$UnitName==iwmm$UnitName[a])]))  {
+iwmm$POINT_X[a]=xycodes$x[which(xycodes$SiteName==iwmm$SiteName[a] & xycodes$UnitName==iwmm$UnitName[a])]
+iwmm$POINT_Y[a]=xycodes$y[which(xycodes$SiteName==iwmm$SiteName[a] & xycodes$UnitName==iwmm$UnitName[a])]
+}
+}
+}
+}
+
+##reformat the dates to get year.week, week values and add to iwmm df##
+date <- as.Date(iwmm$Obs_Date)
+y.w=strftime(date,format="%Y-%W")
+week=strftime(date,format="%W")
+iwmm=data.frame(iwmm, "y.w"=y.w, "date"=date, "Week"=week)
+
+##set lists of unique sites, units, and species##
+site.list=unique(iwmm$SiteName)
+site.unit=unique(iwmm[,c('SiteName','UnitName')])
+species.list=unique(iwmm$common.name)
+#### Create IWMMPullSite function #### 
+# takes species, site, scale (monthly, weekly), and a date range and returns a table from the IWMM database of bird counts over the period.
+
+IWMMPullSite=function(species="NULL", site="all", scale="NULL", range=c("2010-01-01", "2014-12-31")){
+if(species[1]!="NULL"){
+suppressWarnings(
+for (i in 1:length(species)){
+  species[i]=species.finder(species[i])
+  if(species[i]=="Species not found") {return("Species not found")}
+}
+)
+if(site[1]!="all"){
+suppressWarnings(
+for (i in 1:length(site)){
+  site[i]=site.finder(site[i])
+  if(site[i]=="Site not found") {return("Site not found")}}
+)
+if(scale=="weekly"){
+  temp=subset(iwmm, iwmm$SiteName %in% site)
+  temp=subset(temp, temp$common.name %in% species)
+  temp2=aggregate(Count~SiteName+common.name+Week+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+  temp$common.name=as.character(temp$common.name)
+}   #end weekly
+if(scale=="annual"){
+  temp=subset(iwmm, iwmm$SiteName %in% site)
+  temp=subset(temp, temp$common.name %in% species)
+  temp2=aggregate(Count~SiteName+common.name+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+  temp$common.name=as.character(temp$common.name)
+}   #end annual
+if(scale=="monthly"){
+  temp=subset(iwmm, iwmm$SiteName %in% site)
+  temp=subset(temp, temp$common.name %in% species)
+  temp2=aggregate(Count~SiteName+common.name+Month+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+  temp$common.name=as.character(temp$common.name)
+}  #end monthly
+if(scale=="NULL"){
+  temp=subset(iwmm, iwmm$SiteName %in% site)
+  temp=subset(temp, temp$common.name %in% species)
+  temp2=aggregate(Count~SiteName+common.name+Week+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+  temp$common.name=as.character(temp$common.name)
+}     #end NULL
+} #end site!=all
+if(site[1]=="all"){
+if(scale=="weekly"){
+  temp=subset(iwmm, iwmm$common.name %in% species)
+  temp2=aggregate(Count~SiteName+common.name+Week+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+  temp$common.name=as.character(temp$common.name)
+			}   #end weekly
+if(scale=="annual"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end annual
+if(scale=="monthly"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Month+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end monthly
+if(scale=="NULL"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Week+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end NULL
+}
+} #end species!= NULL
+##############################
+if(species[1]=="NULL"){
+if(site[1]=="all"){
+if(scale=="weekly"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Week+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end weekly
+if(scale=="annual"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end annual
+if(scale=="monthly"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Month+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end monthly
+if(scale=="NULL"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Week+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end NULL
+} #end site=all#
+if(site[1]!="all"){
+suppressWarnings(
+for (i in 1:length(site)){
+site[i]=site.finder(site[i])
+if(site[i]=="Site not found") {return("Site not found")}
+}
+)
+if(scale=="weekly"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp2=aggregate(Count~SiteName+common.name+Week+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end weekly
+if(scale=="annual"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp2=aggregate(Count~SiteName+common.name+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end annual
+if(scale=="monthly"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp2=aggregate(Count~SiteName+common.name+Month+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end monthly
+if(scale=="NULL"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp2=aggregate(Count~SiteName+common.name+Week+Year, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+
+temp$common.name=as.character(temp$common.name)
+			}   #end NULL
+} #end site!=all#
+}  ##end species==NULL##
+return(temp2)
+}
+# END OF IWMMPullSite 
+#### Create IWMMPullUnit function ####
+# takes species, site, scale (monthly, weekly), and a date range and returns a table from the IWMM database of bird counts over the period. 
+IWMMPullUnit=function(species="NULL", site="all", scale="NULL", range=c("2010-01-01", "2014-12-31")){
+if(species[1]!="NULL"){
+suppressWarnings(
+for (i in 1:length(species)){
+species[i]=species.finder(species[i])
+if(species[i]=="Species not found") {return("Species not found")}
+}
+)
+if(site[1]!="all"){
+suppressWarnings(
+for (i in 1:length(site)){
+site[i]=site.finder(site[i])
+if(site[i]=="Site not found") {return("Site not found")}
+}
+)
+if(scale=="weekly"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp=subset(temp, temp$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Week+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end weekly
+if(scale=="annual"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp=subset(temp, temp$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end annual
+if(scale=="monthly"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp=subset(temp, temp$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Month+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end monthly
+if(scale=="NULL"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp=subset(temp, temp$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Week+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end NULL
+} #end site!=all#
+if(site[1]=="all"){
+if(scale=="weekly"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Week+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end weekly
+if(scale=="annual"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end annual
+if(scale=="monthly"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Month+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end monthly
+if(scale=="NULL"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Week+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end NULL
+		}
+	}  ###end species!=NULL###
+
+if(species[1]=="NULL"){
+if(site[1]=="all"){
+if(scale=="weekly"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Week+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end weekly
+if(scale=="annual"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end annual
+if(scale=="monthly"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Month+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end monthly
+if(scale=="NULL"){
+temp=subset(iwmm, iwmm$common.name %in% species)
+temp2=aggregate(Count~SiteName+common.name+Week+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end NULL
+		} #end site=all#
+if(site[1]!="all"){
+suppressWarnings(
+for (i in 1:length(site)){
+site[i]=site.finder(site[i])
+if(site[i]=="Site not found") {return("Site not found")}
+}
+)
+if(scale=="weekly"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp2=aggregate(Count~SiteName+common.name+Week+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end weekly
+if(scale=="annual"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp2=aggregate(Count~SiteName+common.name+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end annual
+if(scale=="monthly"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp2=aggregate(Count~SiteName+common.name+Month+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end monthly
+if(scale=="NULL"){
+temp=subset(iwmm, iwmm$SiteName %in% site)
+temp2=aggregate(Count~SiteName+common.name+Week+Year+UnitName, data=temp[temp$date>range[1] & temp$date<range[2],], sum)
+temp$common.name=as.character(temp$common.name)
+			}   #end NULL
+} #end site!=all#
+}  ##end species==NULL##
+return(temp2)
+}
+# END of IWMMPullUnit
+#### Create eBird functions ####
+eBirdPull=function(species){
+species.approx=species
+if(species.finder(species) != "Species not found"){
+species.approx=species.finder(species)
+}
+ebird.dir=paste(getwd(), "/ebird/species", sep="")
+files=list.files(ebird.dir)
+for (i in 1:length(files)){
+if(species.finder(substr(files[i], 1, nchar(files[i])-4), error=FALSE )==species.approx || substr(files[i], 1, nchar(files[i])-4) ==species) {
+temp=read.delim(paste(ebird.dir, "/", files[i], sep=""), header=FALSE, na.strings=c(""))
+colnames(temp)=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE")
+temp=data.frame(temp, "YEAR"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%Y")),"MONTH"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%m")), "WEEK"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE), format="%W")))
+temp=temp[as.numeric(temp$YEAR)>=2010,]
+temp$OBSERVATION.COUNT=as.numeric(temp$OBSERVATION.COUNT)
+temp=temp[!duplicated(temp),]
+temp[complete.cases(temp),]
+return(temp)
+}
+}
+}
+
+eBirdDay=function(species, day=NULL, week=NULL){
+if(is.null(day) & is.null(week)){
+print("ERROR: Must specify day= or week=")
+return()
+}
+if(is.null(day)==FALSE){
+day=strptime(day, "%B %d")
+week=as.numeric(strftime(day, format="%W"))
+}
+data=eBirdPull(species)
+data=data[data$WEEK==week & data$YEAR==2013,]
+temp.data=aggregate(OBSERVATION.COUNT~LATITUDE+LONGITUDE+WEEK, data=data, max)
+return(temp.data)
+}
+
+eBirdLong=function(data){
+rows=rep(1:nrow(data), data$OBSERVATION.COUNT)
+data2=data[rows,1:2]
+data2=data.frame(LONGITUDE=data2[,2], LATITUDE=data2[,1])
+return(data2)
+}
+
+ccf.weekly=function(species, site1, site2, lag=26, weeks=c(1,52)){
+  site1=site.finder(site1)
+  site2=site.finder(site2)
+  first=weeks[1]
+  last=weeks[2]
+  iwmm1=IWMMPull(species=species, site=site1, scale="weekly")
+  iwmm1=aggregate(Count~Week, data=iwmm1, mean)
+  iwmm2=IWMMPull(species=species, site=site2, scale="weekly")
+  iwmm1=aggregate(Count~Week, data=iwmm2, mean)
+  data=mba.ebird(species, scale="weekly", cells=100, plot=FALSE)
+  data[is.na(data)]=0
+  for (i in 4:length(data[1,])){
+    for (j in 1:nrow(data)){
+      if(data[j,i]<0) {data[j,i]=0}
+    }
+  }
+  pairs=t(rbind(data[,4:57]))
+  print(head(pairs))
+  a=matrix(NA,nrow=ncol(pairs), ncol=ncol(pairs))
+  b=matrix(NA,nrow=ncol(pairs), ncol=ncol(pairs))
+  for (i in 1:ncol(pairs)){
+    for (j in 1:ncol(pairs)){
+      temp=ccf(pairs[,i],pairs[,j], plot=FALSE, lag.max=lag)
+      if(is.nan(temp$acf[1])==FALSE){
+        a[i,j]=temp$acf[which.max(temp$acf)]
+        b[i,j]=temp$lag[which.max(temp$acf)]
+      }
+      if(is.nan(temp$acf[1])==TRUE){
+        a[i,j]=0
+        b[i,j]=0
+      }
+      
+    }}
+  par(mfrow=c(1,2))
+  s1=which(data$site==site1)
+  s2=which(data$site==site2)
+  print(s1)
+  print(s2)
+  set1=pairs[,s1]
+  for (j in 1:54){
+    for (k in 1:length(iwmm1$Week)){
+      if(iwmm1$Week[k]==j) {set1[j]=((iwmm1$Count[k]+set1[k])/2)}
+    }}
+  set2=pairs[,s2]
+  for (j in 1:54){
+    for (k in 1:length(iwmm2$Week)){
+      if(iwmm2$Week[k]==j) {set2[k]=((iwmm2$Count[j]+set2[k])/2)}
+    }}
+  set1[is.na(set1)]=0
+  set2[is.na(set2)]=0
+  comp=ccf(set1,set2,lag.max=lag, plot=FALSE)
+  plot(comp, main=sprintf("CCF of %s vs. %s", site1, site2))
+  plot(pairs[,s1], main=sprintf("Counts for %s", species), xlab="Week", ylab="Count")
+  legend(0, max(set1), c(site1, site2), pch=c(1,2))
+  points(set2, pch=2)
+  return(data.frame(acf=a,lag=b))
+}
+
+mba.ebird=function(data.set, scale="monthly", method="max", cells=100, gisdir="h:/Projects/IWMM/gis", plot=TRUE){
+  # create map of ebird counts by month or week
+  #species=species.finder(species)
+  #data.set=eBirdPull(species)
+  max.count=max(data.set$OBSERVATION.COUNT)
+  flag=FALSE
+  regions=readOGR("N:/NWRS/DNR/Coastal_Network/Impoundments", "Regions_345")
+  regions=crop(regions, extent(-97.23, -66.56, 24.47, 49.38))
+  
+  if(scale=="monthly"){
+    sites.xy=data.frame(site=aggregate(x~SiteName, data=xycodes, mean)$SiteName,x=aggregate(x~SiteName, data=xycodes, mean)$x,y=aggregate(y~SiteName, data=xycodes, mean)$y, jan=0, feb=0, mar=0, apr=0, may=0, jun=0, jul=0, aug=0, sep=0, oct=0, nov=0, dec=0) 
+    if(plot==TRUE){par(mfrow=c(3,4));par(mar=c(0.5,0.5,0.5,0.5))}
+    for (i in 1:12) {
+      temp.r=raster(nrow=cells, ncol=cells, xmn=bbox(regions)["x", "min"], xmx=bbox(regions)["x", "max"], ymn=bbox(regions)["y", "min"], ymx=bbox(regions)["y", "max"], crs=proj4string(regions))
+      temp.ebird=subset(data.set, MONTH %in% c(i))
+      coordinates(temp.ebird)=~LONGITUDE+LATITUDE
+      temp.r2=rasterize(x=temp.ebird, y=temp.r, field=temp.ebird$OBSERVATION.COUNT, fun=method)
+      temp=(as.data.frame(temp.r2, xy=TRUE))
+      temp=temp[!is.na(temp$layer),]
+      if(sum(temp$layer)<500){flag=TRUE}
+      if(sum(temp$layer)>500){flag=FALSE}
+      if(flag!=TRUE){mba.int=mba.surf(temp, cells, cells, extend=TRUE)$xyz.est}
+      if(plot==TRUE){
+        if(flag != TRUE){
+          mba=raster(mba.int)
+          projection(mba)=projection(regions)
+          mba=mask(mba,regions)
+          #plot(mba, add=TRUE,zlim=c(0,max.count))
+          
+          plot(mba, col= colorRampPalette(c("white","lightblue", "yellow","orangered", "red"))(12), legend = FALSE) 
+          plot(regions, add=TRUE)
+          r.range = c(min(minValue(mba)), max(minValue(mba)))
+          plot(mba, add=TRUE,legend.only=TRUE, colorRampPalette(c("white","lightblue", "yellow","orangered", "red"))(12), legend.width=1, legend.shrink=0.75, axis.args=list(at=seq(r.range[1], r.range[2], abs(r.range[1]-r.range[2])/4), labels=seq(r.range[1], r.range[2], abs(r.range[1]-r.range[2])/4), cex.axis=0.6),legend.args=list(text='count', side=1, font=2, line=2.5, cex=0.8))
+        }
+      }
+      if(flag != TRUE){pred=mba.points(temp, data.frame(x=sites.xy$x, y=sites.xy$y), extend=FALSE)
+      sites.xy=data.frame(sites.xy, pred$xyz.est[,3])}
+      if(flag == TRUE){sites.xy=data.frame(sites.xy, rep(0,length(sites.xy$x)))}
+  }}  ###end monthly###
+  
+  if(scale=="weekly"){
+    sites.xy=data.frame(site=aggregate(x~SiteName, data=xycodes, mean)$SiteName,x=aggregate(x~SiteName, data=xycodes, mean)$x,y=aggregate(y~SiteName, data=xycodes, mean)$y) 
+    if(plot==TRUE){par(mfrow=c(7,8));par(mar=c(0,0,0,0))}
+    for (i in 0:53) {
+      temp.r=raster(nrow=cells, ncol=cells, xmn=bbox(regions)["x", "min"], xmx=bbox(regions)["x", "max"], ymn=bbox(regions)["y", "min"], ymx=bbox(regions)["y", "max"], crs=proj4string(regions))
+      temp.ebird=subset(data.set, WEEK %in% c(i))
+      if(sum(temp.ebird$OBSERVATION.COUNT)==0){flag=TRUE}
+      if(sum(temp.ebird$OBSERVATION.COUNT)!=0){flag=FALSE}
+      if(flag==FALSE){
+        coordinates(temp.ebird)=~LONGITUDE+LATITUDE
+        temp.r2=rasterize(x=temp.ebird, y=temp.r, field=temp.ebird$OBSERVATION.COUNT, fun=method)
+        temp=(as.data.frame(temp.r2, xy=TRUE))
+        temp=temp[!is.na(temp$layer),]
+      }
+      if(sum(temp.ebird$OBSERVATION.COUNT)<500){flag=TRUE}
+      if(sum(temp.ebird$OBSERVATION.COUNT)>=500){flag=FALSE}
+      if(flag!=TRUE){
+        mba.int=mba.surf(temp, cells, cells, extend=TRUE)$xyz.est
+      }
+      if(plot==TRUE){
+        plot(regions)
+        if(flag != TRUE){
+          mba=raster(mba.int)
+          projection(mba)=projection(regions)
+          mba=mask(mba,regions)
+          plot(mba, add=TRUE, zlim=c(0,max.count/2))
+        }
+      }
+      if(flag != TRUE){pred=mba.points(temp, data.frame(x=sites.xy$x, y=sites.xy$y), extend=FALSE)
+      sites.xy=data.frame(sites.xy, pred$xyz.est[,3])}
+      if(flag == TRUE){sites.xy=data.frame(sites.xy, rep(0,length(sites.xy$x)))}
+    } 
+    colnames(sites.xy)[4:length(sites.xy[1,])]=0:53
+  }    ###end weekly###
+  invisible(sites.xy)
+}
+
+pattern.ebird=function(species=NULL, site=NULL, cells=100, scale=NULL, method="max"){
+  species=species.finder(species)
+  site=site.finder(site)
+  temp.mba=mba.ebird(species=species, scale=scale, method=method, cells=cells, plot=FALSE)
+  temp.mba=temp.mba[temp.mba$site==site,]
+  print(site.finder(site))
+  temp.mba=t(temp.mba[1,4:length(temp.mba)])
+  temp.mba[is.na(temp.mba)] = 0
+  #temp.iwmm=IWMMPull(species=species, site=site, scale=scale) # no iwmmpull function
+  temp.iwmm=IWMMPullSite(species=species, site=site, scale=scale)
+  if(scale=="weekly"){temp.iwmm=aggregate(Count~Week, data=temp.iwmm, mean)}
+  if(scale=="monthly"){temp.iwmm=aggregate(Count~Month, data=temp.iwmm, mean)}
+  #print(temp.iwmm)
+  max.scale=max(c(max(temp.mba[,1]), max(temp.iwmm$Count))+100)
+  par(mar=c(5.1, 4.1, 4.1, 2.1), mfrow=c(1,1), mgp=c(3, 1, 0), las=0)
+  if(scale=="weekly"){
+  plot(1:52, temp.mba[1:52], ylim=c(0,max.scale), xlab="Week", ylab="Mean Count per Week",main=sprintf("%s %s eBird and IWMM counts at %s", species, scale, site))
+    points(temp.iwmm$Count~(as.numeric(temp.iwmm$Week)-1), pch=17)
+    lines(smooth.spline(temp.iwmm$Count~(as.numeric(temp.iwmm$Week)), spar=.35), lty=1)
+    lines(smooth.spline(temp.mba[1:52]~c(1:52), spar=.35), lty=2)
+  }
+  if(scale=="monthly"){plot(1:12, temp.mba, ylim=c(0,max.scale), xlab="Month", ylab="Mean Count per Month",     main=sprintf("%s %s eBird and IWMM counts at %s", species, scale, site))
+    points(temp.iwmm$Count~(as.numeric(temp.iwmm$Month)), pch=17)
+    lines(smooth.spline(temp.iwmm$Count~(as.numeric(temp.iwmm$Month)), spar=.35), lty=1)
+    lines(smooth.spline(temp.mba~c(1:12), spar=.35), lty=2)
+  }
+  legend(0, max.scale, c("eBird", "IWMM"), pch=c(1,17), lty=c(2,1))
+}
+
+pattern.ebird.ggplot=function(species=NULL, site=NULL, cells=100, scale=NULL, method="max"){
+  species=species.finder(species)
+  site=site.finder(site)
+  temp.mba=mba.ebird(species=species, scale=scale, method=method, cells=cells, plot=FALSE)
+  temp.mba=temp.mba[temp.mba$site==site,]
+  print(site.finder(site))
+  temp.mba=t(temp.mba[1,4:length(temp.mba)])
+  temp.mba[is.na(temp.mba)] = 0
+  #temp.iwmm=IWMMPull(species=species, site=site, scale=scale) # no iwmmpull function
+  temp.iwmm=IWMMPullSite(species=species, site=site, scale=scale)
+  if(scale=="weekly"){temp.iwmm=aggregate(Count~Week, data=temp.iwmm, mean)}
+  if(scale=="monthly"){temp.iwmm=aggregate(Count~Month, data=temp.iwmm, mean)}
+  #print(temp.iwmm)
+  max.scale=max(c(max(temp.mba[,1]), max(temp.iwmm$Count))+100)
+  par(mar=c(5.1, 4.1, 4.1, 2.1), mfrow=c(1,1), mgp=c(3, 1, 0), las=0)
+  if(scale=="weekly"){
+    plot(1:52, temp.mba[1:52], ylim=c(0,max.scale), xlab="Week", ylab="Mean Count",main=sprintf("%s %s eBird and IWMM counts at %s", species, scale, site))
+    points(temp.iwmm$Count~(as.numeric(temp.iwmm$Week)-1), pch=17)
+    lines(smooth.spline(temp.iwmm$Count~(as.numeric(temp.iwmm$Week)), spar=.35), lty=1)
+    lines(smooth.spline(temp.mba[1:52]~c(1:52), spar=.35), lty=2)
+  }
+  if(scale=="monthly"){plot(1:12, temp.mba, ylim=c(0,max.scale), xlab="Month", ylab="Mean Count",     main=sprintf("%s %s eBird and IWMM counts at %s", species, scale, site))
+    points(temp.iwmm$Count~(as.numeric(temp.iwmm$Month)), pch=17)
+    lines(smooth.spline(temp.iwmm$Count~(as.numeric(temp.iwmm$Month)), spar=.35), lty=1)
+    lines(smooth.spline(temp.mba~c(1:12), spar=.35), lty=2)
+  }
+  legend(0, max.scale, c("eBird", "IWMM"), pch=c(1,17), lty=c(2,1))
+}
+
+ebird.xy=function(species, method="max", x=NULL, y=NULL, cells=100, gisdir="h:/Projects/IWMM/gis", plot=FALSE){
+  species=species.finder(species)
+  data.set=eBirdPull(species)
+  max.count=max(data.set$OBSERVATION.COUNT)
+  flag=FALSE
+  regions=readOGR("N:/NWRS/DNR/Coastal_Network/Impoundments", "Regions_345")
+  regions=crop(regions, extent(-97.23, -66.56, 24.47, 49.38))
+  pred.xy=rep(0,53)
+  if(plot==TRUE){
+    par(mfrow=c(7,8))
+    par(mar=c(0,0,0,0))
+  }
+  for (i in 0:53) {
+    temp.r=raster(nrow=cells, ncol=cells, xmn=bbox(regions)["x", "min"], xmx=bbox(regions)["x", "max"], ymn=bbox(regions)["y", "min"], ymx=bbox(regions)["y", "max"], crs=proj4string(regions))
+    temp.ebird=subset(data.set, WEEK %in% c(i))
+    if(sum(temp.ebird$OBSERVATION.COUNT)==0){flag=TRUE}
+    if(sum(temp.ebird$OBSERVATION.COUNT)!=0){flag=FALSE}
+    if(flag==FALSE){
+      coordinates(temp.ebird)=~LONGITUDE+LATITUDE
+      temp.r2=rasterize(x=temp.ebird, y=temp.r, field=temp.ebird$OBSERVATION.COUNT, fun=method)
+      temp=(as.data.frame(temp.r2, xy=TRUE))
+      temp=temp[!is.na(temp$layer),]
+    }
+    if(sum(temp.ebird$OBSERVATION.COUNT)<500){flag=TRUE}
+    if(sum(temp.ebird$OBSERVATION.COUNT)>=500){flag=FALSE}
+    if(flag!=TRUE){
+      mba.int=mba.surf(temp, cells, cells, extend=TRUE)$xyz.est
+    }
+    if(plot==TRUE){
+      plot(regions)
+      if(flag != TRUE){
+        mba=raster(mba.int)
+        projection(mba)=projection(regions)
+        mba=mask(mba,regions)
+        plot(mba, add=TRUE, zlim=c(0,max.count/2))
+      }
+    }
+    if(flag != TRUE){pred=mba.points(temp, data.frame(x=x, y=y), extend=FALSE)
+    pred.xy[i]=pred$xyz.est[,3]}
+    if(flag == TRUE){pred.xy[i]=0}
+  } 
+  pred.xy[pred.xy < 0]=0
+  pred.xy[is.na(pred.xy)]=0
+  plot(pred.xy, xlab="Week", ylab="eBird Surface Estimate", main=sprintf("Predicted counts of %s at %f , %f", species, x,y))
+  lines(smooth.spline(pred.xy, spar=.5))
+  return(pred.xy)
+}
+#### Create RLcompare function ####
+RLcompare= function(sites, weeks=c(1:52), species) {
+  for (i in 1:length(sites)){
+    sites[i]=site.finder(sites[i])
+    if(sites[i]=="Site not found") {return("Site not found")}
+  }
+  species=species.finder(species)
+  temp=aggregate(Count~common.name+Year+Month, data=iwmm[iwmm$SiteName==site,], sum)
+  temp$common.name=as.character(temp$common.name)
+  temp=subset(temp, temp$common.name %in% sp.list$species & temp$Month %in% months, drop=TRUE)
+  new=aggregate(Count~Month, data=temp, mean)
+  new=data.frame(Count=new$Count, Month=new$Month)
+  new2=data.frame(Month=months, ebird=t(abdu[abdu$site==site, 4:15]))
+  print(new)
+  print(new2)
+}
+#### Create RLtop function ####
+# takes (site, how.many, range, do.plot) and reports the top how.many species on the refuge (site) between the dates in range.  If do.plot is set to TRUE, a summary histogram will be generated.  Range values must be  dates in the format "YYYY-MM-DD"
+RLtop= function(site, how.many=5, range=c("2010-01-01", "2014-12-31"), do.plot=FALSE, hide=FALSE) {
+site=site.finder(site)
+if(site=="Site not found") {return("Site not found")}
+#range2=strftime(range,format="%Y-%W")
+range=as.Date(range)
+if(hide==FALSE) {cat(sprintf("Top %s species counted at %s for the period %s to %s:", how.many, site, range[1], range[2]), "\n \n")}
+temp=aggregate(Count~common.name, data=iwmm[iwmm$SiteName==site & date>range[1] & date<range[2],], sum)
+temp=data.frame("Common Name"=temp$common.name, "Count"=temp$Count)
+temp=temp[order(-temp$Count),]
+temp=temp[1:how.many,]
+temp[,1]=as.character(temp[,1])
+row.names(temp)=c(1:how.many)
+if(hide==FALSE) {print(temp)} #change in Rmarkdown to print ktable
+if(do.plot==TRUE){
+par(mar=c(10,4,2,4))
+par(oma=c(0,0,0,0))
+plot(temp$Count, axes=FALSE, ylab="Count", xlab=" ", type='h', lwd=8, ylim=c(0,max(temp$Count)))
+axis(2)
+box()
+text(seq(1-how.many/115, how.many, by=1),-.05*max(temp$Count), labels = temp$Common.Name, srt = 90, pos = 1, xpd = TRUE, offset=4,cex=.8)
+title(sprintf("Top %s species counted at %s for the period %s to %s:", how.many, site, range[1], range[2]))
+}
+invisible(temp)
+}
+#### Create SppCompare function ####
+SppCompare= function(site, unit="all", spp="top 5", range=c("2010-01-01", "2014-12-31")) {
+site=site.finder(site)
+if(site=="Site not found") {return("Site not found")}
+suppressWarnings(
+if(spp=="top 5")
+{sp.list=data.frame(species=RLtop(site=site, how.many=5, range=range, hide=TRUE)[,1])}
+else
+{
+for (i in 1:length(spp)){
+spp[i]=species.finder(spp[i])
+if(spp[i]=="Species not found") {return("Species not found")}}
+sp.list=data.frame(species=spp)})
+range=as.Date(range)
+if(unit=="all") {
+temp=aggregate(Count~common.name+y.w, data=iwmm[iwmm$SiteName==site & date>range[1] & date<range[2],], sum)
+temp$y.w=as.character(temp$y.w)
+temp$y.w=as.factor(temp$y.w)
+max.y=1.1*max(temp$Count[temp$common.name %in% sp.list$species])
+temp$common.name=as.character(temp$common.name)
+colors=c(1:length(sp.list$species))
+for (j in 1:length(sp.list$species)) { 
+if(j==1){
+plot(Count~y.w, data=temp[temp$common.name==sp.list$species[j],],ylim=c(0,max.y), col=colors[j], xlab="Year-Week")
+lines(smooth.spline(temp$Count[temp$common.name==sp.list$species[j]]~temp$y.w[temp$common.name==sp.list$species[j]], spar=.35), col=colors[j])
+#title(sprintf("Comparison of weekly counts at %s for the period %s to %s", site, range[1], range[2]))
+#title(as.character(sp.list$species))
+}
+else
+{
+points(Count~y.w, data=temp[temp$common.name==sp.list$species[j],], col=colors[j], xlab="Year-Week")
+lines(smooth.spline(temp$Count[temp$common.name==sp.list$species[j]]~temp$y.w[temp$common.name==sp.list$species[j]], spar=.35), col=colors[j])
+title(sprintf("Comparison of weekly counts at %s for the period %s to %s", site, range[1], range[2]))
+#title(as.character(sp.list$species))
+}
+}
+legend(0, 0.95*max.y, legend=sp.list$species, lwd=2, col=colors)
+}
+else {
+temp=aggregate(Count~common.name+UnitName+y.w, data=iwmm[iwmm$SiteName==site & date>range[1] & date<range[2],], sum)
+temp$y.w=as.character(temp$y.w)
+temp$y.w=as.factor(temp$y.w)
+max.y=1.1*max(temp$Count[temp$common.name %in% sp.list$species])
+temp$common.name=as.character(temp$common.name)
+colors=c(1:length(sp.list$species))
+for (j in 1:length(sp.list$species)) { 
+if(j==1){
+plot(Count~y.w, data=temp[temp$common.name==sp.list$species[j] & temp$UnitName==unit,], ylim=c(0,max.y), col=colors[j], xlab="Year-Week")
+lines(smooth.spline(temp$Count[temp$common.name==sp.list$species[j] & temp$UnitName==unit]~temp$y.w[temp$common.name==sp.list$species[j] & temp$UnitName==unit], spar=.35), col=colors[j])
+title(sprintf("Comparison of weekly counts at %s in %s for the period %s to %s", unit, site, range[1], range[2]))
+#title(as.character(sp.list$species))
+}
+else
+{
+points(Count~y.w, data=temp[temp$common.name==sp.list$species[j] & temp$UnitName==unit,], col=colors[j])
+lines(smooth.spline(temp$Count[temp$common.name==sp.list$species[j] & temp$UnitName==unit]~temp$y.w[temp$common.name==sp.list$species[j] & temp$UnitName==unit], spar=.35), col=colors[j])
+}
+}
+legend(0, 0.95*max.y, legend=sp.list$species, lwd=2, col=colors)
+}
+##assign(paste("cjs.", spec[zz],".raneff", sep=""), temp.mod, envir = .GlobalEnv)
+}
+#### Create site.finder function ####
+# site.finder takes (site) and reports the closest string match.Useful when the exact site match wording/punctuation is unknown.
+site.finder=function(site){
+temp=agrep(site, site.list, 3, value=TRUE)
+ifelse(length(temp)==1,invisible(temp),
+	{temp=agrep(site, site.list, 2, value=TRUE)
+	ifelse(length(temp)==1,invisible(temp),
+		{temp=agrep(site, site.list, 1, value=TRUE)
+		ifelse(length(temp)==1,invisible(temp), {
+			cat(sprintf("Error: %s returned %s records \n", site, length(temp)))
+			cat(sprintf(" %s \n", temp))
+			invisible("Site not found")})})})
+}
+#### Create species.finder function ####
+# takes (species) and reports the closest string match.Useful when the exact species match wording/punctuation is unknown.	
+species.finder=function(sp, error=TRUE){
+temp=agrep(sp, species.list, 3, value=TRUE)
+ifelse(length(temp)==1,invisible(temp),
+	{temp=agrep(sp, species.list, 2, value=TRUE)
+	ifelse(length(temp)==1,invisible(temp),
+		{temp=agrep(sp, species.list, 1, value=TRUE)
+		ifelse(length(temp)==1,invisible(temp),{
+			if(error==TRUE){
+			cat(sprintf("Warning: %s returned %s records in IWMM \n", sp, length(temp)))
+			cat(sprintf(" %s \n", temp))}
+			invisible("Species not found")})})})
+}
+#### Create RLmonthly function ####
+RLmonthly= function(site, months=c(1:12), spp="top 5", by="year") {
+site=site.finder(site)
+if(site=="Site not found") {return("Site not found")}
+suppressWarnings(
+if(spp=="top 5")
+{sp.list=data.frame(species=RLtop(site=site, how.many=5, hide=TRUE)[,1])}
+else
+{
+for (i in 1:length(spp)){
+spp[i]=species.finder(spp[i])
+if(spp[i]=="Species not found") {return("Species not found")}
+}
+sp.list=data.frame(species=spp)
+}
+)
+temp=aggregate(Count~common.name+Year+Month, data=iwmm[iwmm$SiteName==site,], sum)
+temp$common.name=as.character(temp$common.name)
+temp=subset(temp, temp$common.name %in% sp.list$species & temp$Month %in% months, drop=TRUE)
+if(by=="year"){
+print(ggplot(data=temp)+geom_bar(aes(x=factor(Month), y=Count, fill=common.name), stat="identity", position="dodge")+facet_wrap(~Year, nrow=1)+scale_fill_hue(name="Common Name")+xlab("Month")+ggtitle(sprintf("Monthly counts at %s for the period %s to %s", site, min(temp$Year), max(temp$Year))
+))
+}
+if(by=="species"){
+print(ggplot(data=temp, aes(x=factor(Month), y=Count, group=factor(Year), colour=factor(Year),shape=factor(Year)))+geom_point(size=4)+facet_wrap(~common.name)+xlab("Month")+labs(shape="Year", colour="Year")+ggtitle(sprintf("Monthly counts at %s for the period %s to %s", site, min(temp$Year), max(temp$Year))
+))
+}
+invisible(temp)
+}
+#### Create SiteRank function ####
+SiteRank=function(site, scale="regional", species, year=c(2011,2012,2013,2014), region=5){
+for (i in 1:length(site)){
+site[i]=site.finder(site[i])
+if(site[i]=="Site not found") {return("Site not found")}
+				}
+suppressWarnings(
+if(species=="top 5")
+{sp.list=data.frame(species=RLtop(site=site, how.many=5, range=range, hide=TRUE)[,1])}
+else
+{
+for (i in 1:length(species)){
+species[i]=species.finder(species[i])
+if(species[i]=="Species not found") {return("Species not found")}				}
+sp.list=data.frame(species=species)
+}
+)
+if(scale=="regional"){temp=aggregate(Count~common.name+SiteName+Year+Month, data=iwmm[iwmm$Region==region, ], sum)}
+if(scale=="national"){temp=aggregate(Count~common.name+SiteName+Year+Month, data=iwmm, sum)}
+temp$common.name=as.character(temp$common.name)
+temp=subset(temp, temp$common.name %in% sp.list$species & temp$Year %in% year, drop=TRUE)
+temp.sorted=temp[with(temp,order(common.name, Year, Month, -Count)),]
+#print(temp.sorted)
+#print(length(temp.sorted[,1]))
+final=data.frame(site=factor(), sp=factor(), year=factor(), month=numeric(), rank=numeric(), pct=numeric(), stringsAsFactors=TRUE)
+for (g in 1:length(site))		{
+for (h in 1:length(sp.list$species))	{
+for (i in 1:length(year))				{
+for (j in 1:12) 							{
+temp.set=subset(temp.sorted, temp.sorted$common.name==sp.list$species[h] & temp.sorted$Year==year[i] & temp.sorted$Month==j, drop=TRUE)
+rank=which(temp.set$SiteName==site[g])
+if(any(rank)==FALSE) {rank=NA}
+if(scale=="regional"){pct=(length(as.character(unique(iwmm$SiteName[iwmm$Region==region])))-rank)/length(as.character(unique(iwmm$SiteName[iwmm$Region==region])))*100
+}
+if(scale=="national"){pct=(length(as.character(unique(iwmm$SiteName)))-rank)/length(as.character(unique(iwmm$SiteName)))*100
+}
+final=rbind(final, data.frame(site=site[g], sp=sp.list$species[h], year=year[i], month=j, rank=rank, pct=round(pct, digits=0)))
+}}}}
+print(ggplot(data=final,aes(x=month, y=pct, group=sp, colour=sp,shape=sp))+facet_grid(site~year)+geom_point()+geom_line()+xlab("Month")+ggtitle(sprintf("Monthly percentile for counts for the period %s to %s", min(final$year), max(final$year))))
+}
+#### Create MapUSFWS function - FOLDER IS UNAVAILABLE, don't use this function? ####
+MapUSFWS=function(gisdir="n:/NWRS/DNR/Coastal_Network/chucks_stuff", region="all"){
+map1=readOGR(gisdir, "Region_345")
+map1=fortify(map1)
+if(region=="all"){
+return(map1)
+}
+}
+# replaced with Nate's file location and shapefile name 12/27/2016
+MapUSFWS=function(gisdir="N:/NWRS/DNR/Coastal_Network/Impoundments", region="all"){
+  map1=readOGR(gisdir, "Regions_345")
+  map1=fortify(map1)
+  if(region=="all"){
+    return(map1)
+  }
+}
+```
+
+## SDM Overview
+
+Overview of decision theory (structured decision-making framework) and steps (insert figure).
+
+1) **Pr**oblem framing 
+- who is the decision-maker/s
+- how are stakeholder values included
+- what is the timeframe
+- what is the scope (spatial and potential actions)
+
+2) **O**bjective setting
+- ecological values
+- social values
+- economic values
+
+3) Creating **A**lternatives
+- these are all the action/strategies the decision-makers has the authority to make
+
+4) Predicting **C**onsequences
+- science predicts the consequences of each alternative (with key uncertainties)
+
+5) Evaluating **T**radeoffs
+- how much is the decision-maker willing to give to get
+
+6) Repeat
+- what's wrong, refine, expand as needed
+
+Problem framing has not been done (this could be a white paper - what are all the ways impoundment decisions can be framed and by who - IWMM tech/decision team could take this on).
+
+Fundamental objectives reflect the end outcome that we are trying to acheive by making a decision. Fundamental objectives differ from means objectives, which are ways which we can achieve fundamental objectives. By asking "why is this important?", managers can descover fundamental objectives. Fundamental objectives for impoudments broadly occur in three categories: economic value, social value, and ecological value. This document addresses how fundamental ecological values are selected and predicted across impoundments in the NE. Economic and social values are being explore elsewhere by Tsipoura et al. 
+
+Fundamental objectives for impoundments can be acheived by conducting a range of potential management actions including removing impoundments, restoring old impoundments to functioning impoudments, coverting impoundments to natural wetlands, building more impoundments, improving/adding infrustructure/control structures, conducting water-level and/or vegetation management, etc. Selecting impoundment-specific actions and will depend on the decision-making agency with the authority to act (federal impoudments = NWRS refuge managers; state impoundments = state DNRs; private = private land owners), thier values (trade-offs they are willing to make) and the uncertainty involved with achieving the objectives with any given action. This decision-framing step could be the next step in this project (what are the broad strategies that the decision-makers would consider?).
+
+## Ecological Objectives
+
+Problem A: There are a lot of species that use impoundments and setting a fundamental objective for each species may be an inefficient way to capture ecological values (also maybe not be feasible/limited computational time). Thus, grouping species into a range of categories that are distinct, but comprehensively reflect the range of values to each impoundment regulating agency is important.
+
+Solution A: Group species into groups by ES status, game birds, risk of decline, a range of ecological/functional guilds.
+
+Step 1: Remove all species from IWMM databases that are not targets of protocol
+
+- Qualifications in protocol state "All surveys need to be conducted by qualified individuals. Surveyors should be able to: 
+- Identify waterbird species
+- Identify common wetland plant species
+- Estimate large numbers of waterbirds using advocated techniques
+- Follow survey protocols"
+
+**DISCUSSION - WATERBIRDS ARE THE ONLY GROUP OF BIRDS REQUIRED TO BE ACCURATELY IDENTIFIED. DO WE TRUST OTHER ID'S. WHY OR WHY NOT?**
+
+Step 2: Categorize species based on ecological functional groups. 
+
+- Shorebirds
+- Winter waterfowl
+- Long-legged waders
+
+These groups generally represent speices with similar value. For example, Great Blue Heron and Glossy Ibis are both considered representative of long-legged waterbird function equally. Counts of one species are considered equally valuable as counts of the other. 
+
+Table 1. Speices that have been excluded and functions groups of species included.
+
+**DISCUSSION  - DOES THIS LIST LOOK ACCURATE? WHAT OTHER ATTRIBUTES/FUNCTIONAL GROUPS/TRAITS SHOULD WE INCLUDE OR EXCLUDE?**
+
+```{r,echo=FALSE}
+species.list<-read.csv("H:/iwmm/data/IWMM_specieslist_2010_2014.csv",header=TRUE)
+species.table<-species.list%>%filter(IWMM_db2010to2014=="y")%>%dplyr::select(IWMM_protocol,common_name,nellie_longleggedwaterbirds,nellie_shorebirds,nellie_waterfowl,genus,species,es_status,population_objectives)
+colnames(species.table)<-c("Focal IWMM","Common Name","Long-legged Waterbirds","Shorebirds","Waterfowl","Genus","species","ES Status","Pop Objectives")
+datatable(species.table,caption="Table 1. List of speices considered in ecological values assessment of impoundments. 2 = maybe, NEED = Need to fill in information; still need to fill in focal_IWMM and es status")
+```
+
+TO DO: OBTAIN FOCAL IWMM SPECIES LIST, ES SPECIES LIST, POP OBJECTIVE FOR OTHER SPECIES?
+
+Problem B: What scale do you want ecological values (unit or cluster)?
+
+Solution B: 
+
+```{r,echo=FALSE}
+library(maptools)
+map<-list()
+map$impoundments=readShapeSpatial("N:/NWRS/DNR/Projects/NJAudubon_Impoundments/impoundments.shp")
+#map$impoundments<-spTransform(map$impoundments, CRS("+proj=utm +datum=NAD83"))
+map2<-map$impoundments[map$impoundments$Cluster=="Chincoteague",]
+map2<-map$impoundments[map$impoundments$Cluster=="Chincoteague",]
+
+leaflet(data=map$impoundments) %>% addCircleMarkers(~Lat,~Long)
+
+%>%addCircleMarkers(map2$Lat,map2$Long,col="blue")
+```
+
+Problem C: There is missing data (not all sites have IWMM data or continuous data)
+Solution C: Make assumptions about missing data impoundment bird counts
+- option 1:
+- option 2:
+
+Problem D: Metrics  - In addition to identifying fundamental objectives that represent ecological values, each objective requires a measurable attribute that represents (quantitatively or qualitatively) the ecological value. Measurable attributes help the decision-maker assess the consequences of alternatiev strategies in terms of how well they maximize ecological (and economic and social) values. Measurable attributes for impoundments can include: presence/absence of species groups, number of days species groups use each impoundment, and/or total number of birds using an impoundment, or what else... 
+
+Solution D: 
+- average
+- maximum since 2010
+- cv or sd or var (annual variability)
+- peak week (weekly max)
+- bird use days (# days used by a species) - is this what this means?
+- high bird use days (# days used by high number of species or individuals?)
+- birds per hectare?
+
+Will update table below based on potential metrics and then decide on final set to represent ecological values. These metrics then can be obtained using IWMM and/or ebird data or be noted as important, but not able to obtain given current data sources. 
+
+```{r values,echo=FALSE}
+values<-read.table("H:/iwmm/impoundment_values.txt",sep="\t",header=TRUE)
+kable(values,caption="Table 2. List of fundamental objectives and measurable attributes for ecological values of impoundments")
+```
+
+## Maps
+-need to fix projections
+### IWMM Sites
+```{r, warning=FALSE,message=FALSE,results='asis',fig.width=8,fig.height=4}
+iwmmxy=data.frame(LONGITUDE=xycodes$x, LATITUDE=xycodes$y,SiteName=xycodes$SiteName,area=xycodes$area) # 802 sites
+xy<-iwmmxy%>%dplyr::filter(area>0)%>%select(LONGITUDE,LATITUDE,SiteName)
+colnames(xy)<-c("long","lat","SiteName")
+fx.ggplot<-function(ctry,aesfill="id", scalefill="REGION_1", pathcol="white") {
+    ctry@data$id = rownames(ctry@data)
+    ctry.points = fortify(ctry, region="REGION_1")
+    ctry.df = join(ctry.points, ctry@data, by="id")
+    ggplot(ctry.df, aes(long, lat)) +
+        geom_polygon(aes_string(group="group", fill=aesfill)) +
+        #geom_path(colour = pathcol) +
+        scale_fill_grey()+
+        theme_bw()+
+        coord_fixed(ratio = 2)
+}
+#p <- fx.ggplot(try1)
+ggplotly(fx.ggplot(try1)+geom_point(data=xy%>%select(lat,long),col="red",alpha=0.8)+ggtitle("Sites with IWMM Data")+theme(legend.position="none"))
+
+iwmmxy=data.frame(LONGITUDE=xycodes$x, LATITUDE=xycodes$y,SiteName=xycodes$SiteName,area=xycodes$area,region=xycodes$Region) #
+xy<-iwmmxy%>%dplyr::filter(area>0,region==5)%>%select(LONGITUDE,LATITUDE,SiteName)
+colnames(xy)<-c("long","lat","SiteName")
+fx.ggplot<-function(ctry,aesfill="id", scalefill="REGION_1", pathcol="white") {
+    ctry@data$id = rownames(ctry@data)
+    ctry.points = fortify(ctry, region="REGION_1")
+    ctry.df = join(ctry.points, ctry@data, by="id")
+    ggplot(ctry.df, aes(long, lat)) +
+        geom_polygon(aes_string(group="group", fill=aesfill)) +
+        #geom_path(colour = pathcol) +
+        scale_fill_grey()+
+        theme_bw()+
+        coord_fixed(ratio = 2)
+}
+#p <- fx.ggplot(try1)
+ggplotly(fx.ggplot(try1)+geom_point(data=xy%>%select(lat,long),col="red",alpha=0.8)+ggtitle("Sites with IWMM Data in R5")+ylim(35,50)+xlim(-85,-65) +theme(legend.position="none"))
+```
+
+### R5 Impoundments
+```{r, warning=FALSE,message=FALSE,results='asis',fig.width=8,fig.height=4}
+#don't have this database yet (ask nellie)
+map<-list()
+map$impoundments=readOGR("N:/NWRS/DNR/Projects/NJAudubon_Impoundments", "impoundments")
+leaflet()%>%  addCircleMarkers(map$impoundments$Lat,map$impoundments$Long)
+```
+
+### Ebird Sites 
+- don't have this, but can assign ebird to closes impoundment location
+- Or use ebird to predict counts at impoudment locations?
+## IWMM Species totals (barchart) {.tabset}
+### VA to ME (R5)
+All IWMM Species Counts within R5. 
+```{r,message=FALSE}
+df<-df2<-as.data.frame(iwmm %>% dplyr::filter(Region==5)%>%group_by(common.name) %>% summarise(total.count=sum(Count,na.rm=TRUE),number.years=length(unique(Year)),min.year=min(Year),max.year=max(Year),number.days=length(unique(JulianYear)),unique.sites=length(unique(SiteName))) %>% arrange(unique.sites) %>% na.omit())
+```
+- `r length(unique(df$common.name))` species were detected from `r min(df$min.year)` to `r max(df$max.year)` across `r sum(count(unique(iwmm %>% dplyr::filter(Region==5)%>%select(SiteName)))$freq)` sites in R5.
+- Need to group these species into guild or whatever the fundamental objective categories are. 
+
+Table 1.
+```{r,message=FALSE,results="asis"}
+#{ggplot(df %>% arrange(total.count),aes(x=common.name,y=total.count,fill=common.name))+geom_bar(stat="identity") +coord_flip() +guides(colour=FALSE)+theme(legend.position="none")}%>%ggplotly()
+datatable(df,caption="List of each species detected at least once using IWMM protocol in R5 survey sites. Total number of birds counted, number of years each species was detected in at least one site, the first and last year it was detected at any site, total number of days and unique sites it was detected (across all years).")
+```
+### IWMM Total Counts {.tabset}
+#### plot1
+```{r,message=FALSE,fig.width=4,fig.length=4}
+df$common.name<-factor(df2$common.name,levels=df2[order(df$total.count),"common.name"])
+ggplotly(ggplot(df,aes(x=common.name,y=total.count))+geom_bar(stat="identity")+ggtitle("Total counts each species detected within IWMM database from 2010 to 2014")+ theme(axis.text.x=element_text(angle=90,hjust=1,size=4))+coord_flip()+theme_bw())
+```
+#### plot2
+```{r,message=FALSE,fig.width=8,fig.length=8}
+df$common.name<-factor(df2$common.name,levels=df2[order(df$number.days),"common.name"])
+ggplotly(ggplot(df,aes(x=common.name,y=number.days))+geom_bar(stat="identity")+ggtitle("Total number of days each species was detected within IWMM database from 2010 to 2014")+ theme(axis.text.x=element_text(angle=90,hjust=1))+coord_flip()+theme_bw())
+```
+#### plot3
+```{r,message=FALSE,fig.width=8,fig.length=8}
+df$common.name<-factor(df2$common.name,levels=df2[order(df$unique.sites),"common.name"])
+ggplotly(ggplot(df,aes(x=common.name,y=unique.sites))+geom_bar(stat="identity")+ggtitle("Total number of unique sites each species was detected within IWMM database from 2010 to 2014") + theme(axis.text.x=element_text(angle=90,hjust=1))+coord_flip()+theme_bw())
+```
+### ALL
+All IWMM Species Counts
+```{r,message=FALSE}
+df<-df2<-as.data.frame(iwmm %>% group_by(common.name) %>% summarise(total.count=sum(Count,na.rm=TRUE)) %>% arrange(total.count) %>% na.omit())
+df$common.name<-factor(df2$common.name,levels=df2[order(df$total.count),"common.name"])
+{ggplot(df %>% arrange(total.count),aes(x=common.name,y=total.count,fill=common.name))+geom_bar(stat="identity") +coord_flip() +guides(colour=FALSE)+theme(legend.position="none")}%>%ggplotly()
+```
+### Top 20% 
+Top 20% of IWMM Species Counts
+```{r,message=FALSE}
+df<-df2<-as.data.frame(iwmm %>% group_by(common.name) %>% summarise(total.count=sum(Count,na.rm=TRUE)) %>% arrange(total.count) %>% na.omit())
+df$common.name<-factor(df2$common.name,levels=df2[order(df$total.count),"common.name"])
+df<-df %>%  top_n(length(unique(df$common.name))*0.20)
+{ggplot(df %>% arrange(total.count),aes(x=common.name,y=total.count,fill=common.name))+geom_bar(stat="identity") +coord_flip() +guides(colour=FALSE)+theme(legend.position="none")}%>%ggplotly()
+```
+### Lowest 20% 
+Lowest 20% of IWMM Species Counts
+```{r,message=FALSE}
+df<-df2<-as.data.frame(iwmm %>% group_by(common.name) %>% summarise(total.count=sum(Count,na.rm=TRUE)) %>% arrange(total.count) %>% na.omit())
+df$common.name<-factor(df2$common.name,levels=df2[order(df$total.count),"common.name"])
+df<-df %>%  top_n(-length(unique(df$common.name))*0.20)
+{ggplot(df %>% arrange(total.count),aes(x=common.name,y=total.count,fill=common.name))+geom_bar(stat="identity") +coord_flip() +guides(colour=FALSE)+theme(legend.position="none")}%>%ggplotly()
+```
+
+
+
+## Count summaries
+
+Mean and variation in weekly counts per unit area
+```{r,results='asis',message=FALSE,warning=FALSE,eval=FALSE}
+df3<-iwmm %>%dplyr::filter(Region==5)%>% group_by(UnitName,SiteName,Week,Year)  %>% na.omit() %>% summarise(total.species=length(unique(common.name)), median.counts=median(Count,na.rm=TRUE),sd.counts=sd(Count,na.rm=TRUE)) %>% na.omit()
+iwmmxy=data.frame(LONGITUDE=xycodes$x, LATITUDE=xycodes$y, UnitName=xycodes$UnitName, SiteName=xycodes$SiteName, area=xycodes$area) # 802 sites
+iwmmxy<-left_join(iwmmxy,df3)
+{ggplot(iwmmxy%>%na.omit(),aes(area,median.counts,alpha=.5,col=SiteName))+geom_point()+theme_bw()+geom_text(aes(label=SiteName),hjust=0,vjust=0,size=1)+theme(legend.position="none")}%>%ggplotly()
+{ggplot(iwmmxy%>%na.omit(),aes(area,sd.counts,alpha=.5,col=SiteName))+geom_point()+theme_bw()+geom_text(aes(label=SiteName),hjust=0,vjust=0,size=1)+theme(legend.position="none")}%>%ggplotly()
+#{ggplot(iwmmxy%>%na.omit(),aes(y=median.counts,x=SiteName,fill=SiteName))+geom_boxplot(coef=1)+theme_bw()+theme(legend.position="none")+facet_wrap(~Year)}%>%ggplotly()
+```
+
+Mean vs. variation in weekly counts per unit area
+```{r,results='asis',message=FALSE,warning=FALSE,eval=FALSE}
+{ggplot(iwmmxy%>%na.omit(),aes(median.counts,sd.counts,alpha=.5,col=SiteName))+geom_point()+theme_bw()+geom_text(aes(label=SiteName),hjust=0,vjust=0,size=1)+theme(legend.position="none")}%>%ggplotly()
+```
+```{r, warning=FALSE,message=FALSE,results='asis',fig.width=2,fig.height=2,eval=FALSE}
+df3<-iwmm %>% group_by(SiteName)  %>% na.omit() %>% summarise(total.species=length(unique(common.name)), total.counts=sum(Count,na.omit=TRUE))
+#kable(df3)
+iwmmxy=data.frame(LONGITUDE=xycodes$x, LATITUDE=xycodes$y, SiteName=xycodes$SiteName, area=xycodes$area) # 802 sites
+# add total species
+iwmmxy<-left_join(iwmmxy,df3)
+iwmmxy$sp_area<-cut(iwmmxy$total.species/iwmmxy$area, c(0,5,10,20,50,100,200,500), right=FALSE, labels=c(1:7))
+xy<-iwmmxy%>%select(LONGITUDE,LATITUDE)
+colnames(xy)<-c("long","lat")
+
+fx.ggplot<-function(ctry,aesfill="id", scalefill="REGION_1", pathcol="white") {
+    ##ctry is a shapefile of countries
+    ctry@data$id = rownames(ctry@data)
+    ctry.points = fortify(ctry, region="REGION_1")
+    ctry.df = join(ctry.points, ctry@data, by="id")
+    ggplot(ctry.df, aes(long, lat)) +
+        geom_polygon(aes_string(group="group", fill=aesfill)) +
+        #geom_path(colour = pathcol) +
+        scale_fill_grey()+
+        theme_bw()+
+        coord_fixed(ratio = 2)
+}
+#p <- fx.ggplot(try1)
+ggplotly(fx.ggplot(try1) +geom_point(data=xy,col=iwmmxy$sp_area)+theme(legend.position="none"))
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot));leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box");legend <- tmp$grobs[[leg]];return(legend)
+  }
+g1<-fx.ggplot(try1)+geom_point(data=xy,col=iwmmxy$sp_area)
+legend<-g_legend(g1)
+plot(legend, nrow=3)
+# need to add labels to points with sitename
+
+#plot(try1,xlim=c(min(iwmmxy$LONGITUDE)-1,max(iwmmxy$LONGITUDE))+1, ylim=c(min(iwmmxy$LATITUDE)-3, max(iwmmxy$LATITUDE)+2),main="Map of number of species per area")
+#points(iwmmxy$LONGITUDE, iwmmxy$LATITUDE, col = alpha("blue",0.1), pch=19,cex = scale())
+#points(iwmmxy$LONGITUDE, iwmmxy$LATITUDE, col = alpha("blue",0.1), pch=19,cex =as.numeric(iwmmxy$sp_area)/2)
+#box()
+```
+
+
+## Species tables {.tabset}
+Species list in the IWMM database includes (`r length(unique(iwmm$common.name))` species names collected at `r length(unique(iwmm$SiteName))` across `r length(unique(iwmm$Year))` years (`r min(iwmm$Year)` to `r max(iwmm$Year)`)).
+
+### Table 1
+Number of unique sites with at least > 1 count of each species.
+```{r,message=FALSE,warning=FALSE}
+datatable(iwmm%>%na.omit()%>%group_by(common.name)%>%summarise(unique.sites=length(unique(SiteName))))
+```
+### Table 2
+Total bird counts for each species by year.
+```{r,message=FALSE,warning=FALSE}
+datatable(iwmm%>%na.omit()%>%group_by(common.name,Year)%>%summarise(total.count=sum(Count)))
+```
+### Table 3
+Total bird counts for each species by year and site.
+```{r,message=FALSE,warning=FALSE}
+datatable(iwmm%>%na.omit()%>%group_by(common.name,SiteName,Year)%>%summarise(total.count=sum(Count)))
+```
+### Table 4
+Total bird counts for each species by year and site and unit.
+```{r,message=FALSE,warning=FALSE}
+datatable(iwmm%>%na.omit()%>%group_by(common.name,SiteName,UnitName,Year)%>%summarise(total.count=sum(Count)))
+```
+### Table 5
+Total species and counts with speices per area and counts per area.
+```{r,message=FALSE,warning=FALSE}
+df3<-iwmm %>% group_by(SiteName)  %>% na.omit() %>% summarise(total.species=length(unique(common.name)), total.counts=sum(Count,na.omit=TRUE))
+df4<-data.frame(SiteName=xycodes$SiteName, area=round(xycodes$area,digits=2), UnitName=xycodes$UnitName) %>% group_by(SiteName) %>%summarise(area=sum(area))
+# add total species
+df3<-left_join(df3,df4)
+df3$species_perarea<-round(df3$total.species/df3$area,digits=4)
+df3$counts_perarea<-round(df3$total.counts/df3$area,digits=0)
+datatable(df3 %>% arrange(-species_perarea))
+```
+
+## Counts over time {.tabset}
+Example time series for selected species (showing four most abundant species).
+
+### Mallards
+```{r}
+# what refuges have mallards?
+mallard.sites<-unique(iwmm %>% filter(common.name=="Mallard",Count>0) %>%na.omit() %>% select(SiteName))
+species="Mallard"
+site=mallard.sites$SiteName
+dyg1<-as.data.frame(iwmm %>% select(Count,date,SiteName,common.name,UnitName) %>% filter(SiteName %in% site,common.name==species) %>% group_by(date,SiteName) %>% summarise(refuge.count=sum(Count)) %>% select(date,refuge.count,SiteName)) %>% filter(refuge.count>1000)
+dyg2<-spread(dyg1,SiteName,refuge.count)
+qxts <- xts(dyg2[,-1], order.by=as.Date(dyg2$date))
+dygraph(qxts,main = sprintf("%s daily IWMM counts", species)) %>% dyRangeSelector() %>%  dyAxis("y", label = "Sum Bird Counts (Units) per Site") %>% dyLegend(hideOnMouseOut = FALSE) %>% dyOptions(stemPlot=TRUE,colors = colorRampPalette( c("red","blue","orange","green","purple","yellow","black"))(26))
+```
+### Green-winged Teal
+```{r}
+greenwingedteal.sites<-unique(iwmm %>% filter(common.name=="Green-winged Teal",Count>0) %>%na.omit() %>% select(SiteName))
+species="Green-winged Teal"
+site=greenwingedteal.sites$SiteName
+dyg1<-as.data.frame(iwmm %>% select(Count,date,SiteName,common.name,UnitName) %>% filter(SiteName %in% site,common.name=="Green-winged Teal") %>% group_by(date,SiteName) %>% summarise(refuge.count=sum(Count)) %>% select(date,refuge.count,SiteName))
+dyg2<-spread(dyg1,SiteName,refuge.count)
+qxts <- xts(dyg2[,-1], order.by=as.Date(dyg2$date))
+dygraph(qxts,main = sprintf("%s daily IWMM counts", species)) %>% dyRangeSelector() %>%  dyAxis("y", label = "Bird Counts") %>% dyLegend(hideOnMouseOut = FALSE) %>% dyOptions(stemPlot=TRUE,colors = colorRampPalette(c("red","blue","orange","green","purple","yellow","black"))(26))
+```
+
+
+### American Coot
+```{r}
+americancoot.sites<-unique(iwmm %>% filter(common.name=="American Coot",Count>0) %>%na.omit() %>% select(SiteName))
+species="American Coot"
+site=americancoot.sites$SiteName
+dyg1<-as.data.frame(iwmm %>% select(Count,date,SiteName,common.name,UnitName) %>% filter(SiteName %in% site,common.name==species) %>% group_by(date,SiteName) %>% summarise(refuge.count=sum(Count)) %>% select(date,refuge.count,SiteName)) %>% filter(refuge.count>1000)
+dyg2<-spread(dyg1,SiteName,refuge.count)
+qxts <- xts(dyg2[,-1], order.by=as.Date(dyg2$date))
+dygraph(qxts,main = sprintf("%s daily IWMM counts", species)) %>% dyRangeSelector() %>%  dyAxis("y", label = "Bird Counts") %>% dyLegend(hideOnMouseOut = FALSE) %>% dyOptions(stemPlot=TRUE,colors = colorRampPalette(c("red","blue","orange","green","purple","yellow","black"))(26))
+```
+
+### Northern Pintail
+```{r}
+# what refuges have mallards?
+northernpintail.sites<-unique(iwmm %>% filter(common.name=="Northern Pintail",Count>0) %>%na.omit() %>% select(SiteName))
+species="Northern Pintail"
+site=northernpintail.sites$SiteName
+dyg1<-as.data.frame(iwmm %>% select(Count,date,SiteName,common.name,UnitName) %>% filter(SiteName %in% site,common.name==species) %>% group_by(date,SiteName) %>% summarise(refuge.count=sum(Count)) %>% select(date,refuge.count,SiteName)) %>% filter(refuge.count>1000)
+dyg2<-spread(dyg1,SiteName,refuge.count)
+qxts <- xts(dyg2[,-1], order.by=as.Date(dyg2$date))
+dygraph(qxts,main = sprintf("%s daily IWMM counts", species)) %>% dyRangeSelector() %>%  dyAxis("y", label = "Bird Counts") %>% dyLegend( hideOnMouseOut = FALSE) %>% dyOptions(stemPlot=TRUE,colors = colorRampPalette(c("red","blue","orange","green","purple","yellow","black"))(26))
+```
+
+
+## eBird Maps {.tabset}
+Example maps for selected species using ebird data (Mallard example shown).
+
+### Mallards
+```{r,warning=FALSE,results='asis',message=FALSE}
+#data.set<-eBirdPull("Mallard")
+# work around b/c eBirdPull and mba.edbird won't push to knitr
+ebird<-read.table("P:/frost/Projects/IWMM/ebird/species/Mallard.txt",sep = "\t" ,header = FALSE,col.names=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE"))
+temp=read.table("P:/frost/Projects/IWMM/ebird/species/Mallard.txt",sep = "\t" ,header = FALSE,col.names=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE"))
+colnames(temp)=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE")
+temp=data.frame(temp, "YEAR"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%Y")),"MONTH"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%m")), "WEEK"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE), format="%W")))
+temp=temp[as.numeric(temp$YEAR)>=2010,]
+temp$OBSERVATION.COUNT=as.numeric(temp$OBSERVATION.COUNT)
+temp=temp[!duplicated(temp),]
+temp[complete.cases(temp),]
+data.set<-temp
+mba.ebird(data.set, scale="monthly", method="max", cells=50, gisdir="h:/Projects/IWMM/gis", plot=TRUE)
+#pattern.ebird(species="Mallard", site="Parker River National", scale="weekly", cells=100)
+```
+### Green-winged Teal
+```{r,warning=FALSE,results='asis',message=FALSE}
+#data.set<-eBirdPull("Mallard")
+# work around b/c eBirdPull and mba.edbird won't push to knitr
+ebird<-read.table("P:/frost/Projects/IWMM/ebird/species/Green-wingedTeal.txt",sep = "\t" ,header = FALSE,col.names=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE"))
+temp=read.table("P:/frost/Projects/IWMM/ebird/species/Mallard.txt",sep = "\t" ,header = FALSE,col.names=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE"))
+colnames(temp)=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE")
+temp=data.frame(temp, "YEAR"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%Y")),"MONTH"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%m")), "WEEK"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE), format="%W")))
+temp=temp[as.numeric(temp$YEAR)>=2010,]
+temp$OBSERVATION.COUNT=as.numeric(temp$OBSERVATION.COUNT)
+temp=temp[!duplicated(temp),]
+temp[complete.cases(temp),]
+data.set<-temp
+mba.ebird(data.set, scale="monthly", method="max", cells=100, gisdir="h:/Projects/IWMM/gis", plot=TRUE)
+#pattern.ebird(species="Mallard", site="Parker River National", scale="weekly", cells=100)
+```
+### American Coot
+```{r,warning=FALSE,results='asis',message=FALSE}
+#data.set<-eBirdPull("Mallard")
+# work around b/c eBirdPull and mba.edbird won't push to knitr
+ebird<-read.table("P:/frost/Projects/IWMM/ebird/species/AmericanCoot.txt",sep = "\t" ,header = FALSE,col.names=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE"))
+temp=read.table("P:/frost/Projects/IWMM/ebird/species/Mallard.txt",sep = "\t" ,header = FALSE,col.names=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE"))
+colnames(temp)=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE")
+temp=data.frame(temp, "YEAR"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%Y")),"MONTH"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%m")), "WEEK"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE), format="%W")))
+temp=temp[as.numeric(temp$YEAR)>=2010,]
+temp$OBSERVATION.COUNT=as.numeric(temp$OBSERVATION.COUNT)
+temp=temp[!duplicated(temp),]
+temp[complete.cases(temp),]
+data.set<-temp
+mba.ebird(data.set, scale="monthly", method="max", cells=100, gisdir="h:/Projects/IWMM/gis", plot=TRUE)
+#pattern.ebird(species="Mallard", site="Parker River National", scale="weekly", cells=100)
+```
+### Northern Pintail
+```{r,warning=FALSE,results='asis',message=FALSE}
+#data.set<-eBirdPull("Mallard")
+# work around b/c eBirdPull and mba.edbird won't push to knitr
+ebird<-read.table("P:/frost/Projects/IWMM/ebird/species/NorthernPintail.txt",sep = "\t" ,header = FALSE,col.names=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE"))
+temp=read.table("P:/frost/Projects/IWMM/ebird/species/Mallard.txt",sep = "\t" ,header = FALSE,col.names=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE"))
+colnames(temp)=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE")
+temp=data.frame(temp, "YEAR"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%Y")),"MONTH"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE),format="%m")), "WEEK"=as.numeric(strftime(as.Date(temp$OBSERVATION.DATE), format="%W")))
+temp=temp[as.numeric(temp$YEAR)>=2010,]
+temp$OBSERVATION.COUNT=as.numeric(temp$OBSERVATION.COUNT)
+temp=temp[!duplicated(temp),]
+temp[complete.cases(temp),]
+data.set<-temp
+mba.ebird(data.set, scale="monthly", method="max", cells=100, gisdir="h:/Projects/IWMM/gis", plot=TRUE)
+#pattern.ebird(species="Mallard", site="Parker River National", scale="weekly", cells=100)
+```
+
+
+## Common Species 
+```{r,eval=FALSE,results="asis"}
+# view top 10 species for a single refuge
+kt<-iwmm %>% select(SiteName,common.name,Count) %>% na.omit() %>% group_by(SiteName,common.name) %>% summarise(total.count=sum(Count)) %>% arrange_(~desc(total.count)) %>% group_by(SiteName) %>% do(head(.,n=5)) %>% arrange(common.name)
+#kable(kt)
+ggplotly(ggplot(kt,aes(y=total.count,x=SiteName,fill=common.name))+geom_bar(stat="identity")+theme(axis.text.x=element_text(angle=90,hjust=1))+theme_bw()+ theme(legend.position="none"))
+```
+
+## Common Species 2
+```{r,eval=FALSE}
+kt2<-iwmm %>% select(SiteName,common.name,Count) %>% na.omit() %>% group_by(SiteName,common.name) %>% summarize(total.count=sum(Count)) %>% arrange_(~desc(total.count)) %>% group_by(SiteName) %>% do(head(.,n=5)) %>% arrange(SiteName)
+kable(kt2)
+```
+
+
+## IWMM Weekly Counts By Refuge
+- summarized into weekly counts. not sure what this is givin you that the ggplotly is not (counts per day), unless we want to use weekly counts as a metric, then just output metric as needed.
+```{r,echo=FALSE}
+kt<-iwmm %>% select(SiteName,common.name,Count) %>% na.omit() %>% group_by(SiteName,common.name) %>% summarise(total.count=sum(Count)) %>% arrange_(~desc(total.count)) %>% group_by(SiteName) %>% do(head(.,n=5)) %>% arrange(common.name)
+#refuge = which(kt$SiteName== "Parker River National Wildlife Refuge")
+#sort(unique(kt$SiteName))
+```
+```{r,echo=FALSE,results="asis",fig.width=8,fig.height=6}
+refuge="Back Bay NWR"
+SppCompare(site=refuge,unit="all", spp=as.character(c(kt %>% filter(SiteName==refuge) %>% select(common.name[1]))$common.name))
+```
+```{r,echo=FALSE,results="asis",fig.width=8,fig.height=6}
+refuge="Prime Hook NWR, Milton. De"
+SppCompare(site=as.character(refuge),unit="all", spp=as.character(c(kt %>% filter(SiteName==refuge) %>% select(common.name[1]))$common.name))
+```
+```{r,echo=FALSE,results="asis",fig.width=8,fig.height=6}
+refuge="Parker River National Wildlife Refuge"
+SppCompare(site=as.character(refuge),unit="all", spp=as.character(c(kt %>% filter(SiteName==refuge) %>% select(common.name[1]))$common.name))
+```
+
+## Percent of IWMM Birds by Refuge
+
+- Need to figure out what pct really means (y axis) here...ask Chuck...what is 100%?
+ 
+```{r,echo=FALSE}
+SiteRank(site=c("Prime hook", "Iroquois NWR", "Montezuma National","Back Bay NWR"), scale="regional",species=c("Mallard"), region=5)
+```
+
+## Top Species By Refuge
+
+- Not sure what to do with this...
+
+```{r,eval=FALSE}
+RLtop= function(site, how.many=5, range=c("2010-01-01", "2014-12-31"), do.plot=FALSE, hide=FALSE) {
+site=site.finder(site)
+if(site=="Site not found") {return("Site not found")}
+#range2=strftime(range,format="%Y-%W")
+range=as.Date(range)
+if(hide==FALSE) {cat(sprintf("Top %s species counted at %s for the period %s to %s:", how.many, site, range[1], range[2]), "\n \n")}
+temp=aggregate(Count~common.name, data=iwmm[iwmm$SiteName==site & date>range[1] & date<range[2],], sum)
+temp=data.frame("Common Name"=temp$common.name, "Count"=temp$Count)
+temp=temp[order(-temp$Count),]
+temp=temp[1:how.many,]
+temp[,1]=as.character(temp[,1])
+row.names(temp)=c(1:how.many)
+if(hide==FALSE) {print(kable(temp))} #change in Rmarkdown to print ktable
+if(do.plot==TRUE){
+par(mar=c(10,4,2,4))
+par(oma=c(0,0,0,0))
+plot(temp$Count, axes=FALSE, ylab="Count", xlab=" ", type='h', lwd=8, ylim=c(0,max(temp$Count)))
+axis(2)
+box()
+text(seq(1-how.many/115, how.many, by=1),-.05*max(temp$Count), labels = temp$Common.Name, srt = 90, pos = 1, xpd = TRUE, offset=4,cex=.8)
+title(sprintf("Top %s species counted at %s for the period %s to %s:", how.many, site, range[1], range[2]))
+}
+invisible(temp)
+}
+
+datatable(RLtop(site="EB Forsythe", how.many=20, do.plot=FALSE),caption=title(sprintf("Top 20 species at %s with total counts of birds in iwmm database over 5 years",site)))
+```
+
+
+## All IWMM Species 
+Counts (`r length(unique(iwmm$SiteName))` sites and `r length(unique(iwmm$Year))` years)
+
+```{r,eval=FALSE}
+df<-df2<-as.data.frame(iwmm %>% group_by(common.name) %>% summarise(total.count=sum(Count,na.rm=TRUE)) %>% arrange(total.count) %>% na.omit())
+df$common.name<-factor(df2$common.name,levels=df2[order(df$total.count),"common.name"])
+p1<-ggplot(df %>% arrange(total.count),aes(x=common.name,y=total.count)) + geom_bar(stat = "identity") + coord_flip() #+ facet_wrap(~Region)
+p1
+```
+
+## Ebird vs. IWMM
+```{r,eval=FALSE}
+ebird<-read.table("P:/frost/Projects/IWMM/ebird/species/Mallard.txt",sep = "\t" ,header = FALSE,col.names=c("SPECIES", "OBSERVATION.COUNT", "COUNTRY", "LATITUDE", "LONGITUDE", "OBSERVATION.DATE"))
+pattern.ebird(data.set=ebird, site="Parker River National", scale="weekly", cells=100)
+pattern.ebird(species=ebird, site="Parker River National", cells=100, scale="weekly", method="max")
+#pattern.ebird.ggplot=function(species=ebird, site="Parker River National", scale="weekly", cells=100, method="max")
+```
